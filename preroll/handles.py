@@ -29,6 +29,22 @@
 """
 
 
+def _frames_to_samples(frames, sample_rate, fps):
+    """先乘后除、只取整一次的帧->样本换算（与内建 round 的偶数舍入一致）。
+
+    用整数运算避免大数下的浮点误差；不允许逐帧 floor 后累加。
+    """
+    numerator = frames * sample_rate
+    quotient, remainder = divmod(numerator, fps)
+    twice = remainder * 2
+    if twice > fps:
+        return quotient + 1
+    if twice < fps:
+        return quotient
+    # 恰好 .5：round-half-to-even，与 Python 内建 ``round`` 一致。
+    return quotient + (quotient & 1)
+
+
 def expand_clip(clip, preroll_frames, postroll_frames, bounds):
     """把片段的视频区间向前后扩展，并钳制在素材边界内。
 
@@ -66,7 +82,27 @@ def expand_clip(clip, preroll_frames, postroll_frames, bounds):
     * 不修改入参。负 handle、非法 bounds、扩展后空区间或反向区间抛
       :class:`ValueError`。
     """
-    raise NotImplementedError
+    if preroll_frames < 0 or postroll_frames < 0:
+        raise ValueError("preroll_frames 和 postroll_frames 必须 >= 0")
+    if clip["video_start"] >= clip["video_end"]:
+        raise ValueError("原片段的视频区间为空或反向")
+    bound_start = bounds["start"]
+    bound_end = bounds["end"]
+    if bound_start >= bound_end:
+        raise ValueError("bounds 必须满足 start < end")
+
+    new_start = max(bound_start, clip["video_start"] - preroll_frames)
+    # 后卷只加在出点一侧，绝不加到入点。
+    new_end = min(bound_end, clip["video_end"] + postroll_frames)
+    if new_start >= new_end:
+        raise ValueError(
+            f"扩展后区间为空或反向: [{new_start}, {new_end})"
+        )
+
+    out = dict(clip)
+    out["video_start"] = new_start
+    out["video_end"] = new_end
+    return out
 
 
 def audio_offsets(video_start, audio_start, sample_rate, fps):
@@ -100,7 +136,15 @@ def audio_offsets(video_start, audio_start, sample_rate, fps):
     * 返回整数；``sample_rate <= 0``、``fps <= 0`` 或 ``video_start < 0`` 抛
       :class:`ValueError`。
     """
-    raise NotImplementedError
+    if sample_rate <= 0:
+        raise ValueError("sample_rate 必须 > 0")
+    if fps <= 0:
+        raise ValueError("fps 必须 > 0")
+    if video_start < 0:
+        raise ValueError("video_start 必须 >= 0")
+
+    video_sample = _frames_to_samples(video_start, sample_rate, fps)
+    return video_sample - audio_start
 
 
 def trim_to_content(clip, content_len):
@@ -141,7 +185,47 @@ def trim_to_content(clip, content_len):
     * 头部的预卷和尾部的后卷都必须去掉；handle 不计入内容长度。
     * 不修改入参；``content_len`` 非法或内容标记不合法抛 :class:`ValueError`。
     """
-    raise NotImplementedError
+    video_start = clip["video_start"]
+    video_end = clip["video_end"]
+    content_start = clip["content_start"]
+    content_end = clip["content_end"]
+
+    if content_len <= 0:
+        raise ValueError("content_len 必须 > 0")
+    if not (video_start <= content_start < content_end <= video_end):
+        raise ValueError("内容标记不合法：内容必须落在视频区间内部")
+    if content_len > content_end - content_start:
+        raise ValueError("content_len 不能超过可用内容长度")
+
+    sample_rate = clip["sample_rate"]
+    fps = clip["fps"]
+    new_video_start = content_start
+    new_video_end = content_start + content_len
+
+    head_frames = content_start - video_start
+    # 尾部后卷的帧数（video_end - 新区间终点）；缓冲充足时切片终点
+    # head_samples + target_samples 恰好把对应样本排除在外。
+    _tail_frames = video_end - new_video_end
+    head_samples = _frames_to_samples(head_frames, sample_rate, fps)
+    target_samples = _frames_to_samples(content_len, sample_rate, fps)
+
+    audio = clip["audio"]
+    # 按 audio[0] 对应 video_start 的绝对位置切片：头部预卷落在切片之前被裁掉，
+    # 尾部后卷落在切片终点之后被裁掉，handle 不计入内容。缓冲区不足时切片
+    # 自然变短，再在尾部补 0；缓冲偏长时由最终截断收口。
+    kept = list(audio[head_samples: head_samples + target_samples])
+    if len(kept) >= target_samples:
+        new_audio = kept[:target_samples]
+    else:
+        new_audio = kept + [0] * (target_samples - len(kept))
+
+    out = dict(clip)
+    out["video_start"] = new_video_start
+    out["video_end"] = new_video_end
+    out["content_end"] = new_video_end
+    out["audio"] = new_audio
+    out["audio_start"] = clip["audio_start"] + head_samples
+    return out
 
 
 def align_audio(clip, offset_samples):
@@ -174,10 +258,26 @@ def align_audio(clip, offset_samples):
       也不能改变长度。
     * 不修改入参。
     """
-    raise NotImplementedError
+    audio = clip["audio"]
+    length = len(audio)
+
+    if offset_samples >= 0:
+        # 正偏移：头部补静音、尾部丢弃，声音整体向后推迟。
+        offset = min(offset_samples, length)
+        new_audio = [0] * offset + list(audio[: length - offset])
+    else:
+        # 负偏移：丢弃头部、尾部补静音，声音整体提前。
+        shift = min(-offset_samples, length)
+        new_audio = list(audio[shift:]) + [0] * shift
+    new_audio = new_audio[:length]
+
+    out = dict(clip)
+    out["audio"] = new_audio
+    out["audio_start"] = clip["audio_start"] - offset_samples
+    return out
 
 
-def merge_handles(prev, next, max_gap):
+def merge_handles(prev, nxt, max_gap):
     """合并两个相邻片段，重叠的 handle 只保留一次。
 
     参数
@@ -215,7 +315,56 @@ def merge_handles(prev, next, max_gap):
     * 不修改入参；间隔超过 ``max_gap``、顺序错误、采样率或帧率不一致抛
       :class:`ValueError`。
     """
-    raise NotImplementedError
+    if max_gap < 0:
+        raise ValueError("max_gap 必须 >= 0")
+    if prev["video_start"] > nxt["video_start"]:
+        raise ValueError("prev 必须位于 next 之前（video_start 有序）")
+    if prev["sample_rate"] != nxt["sample_rate"] or prev["fps"] != nxt["fps"]:
+        raise ValueError("两个片段的 sample_rate / fps 必须一致")
+
+    gap = nxt["video_start"] - prev["video_end"]
+    if abs(gap) > max_gap:
+        raise ValueError(
+            f"间隔 {gap} 帧超过 max_gap={max_gap}，不允许合并"
+        )
+
+    sample_rate = prev["sample_rate"]
+    fps = prev["fps"]
+    video_start = prev["video_start"]
+    video_end = max(prev["video_end"], nxt["video_end"])
+
+    prev_audio = list(prev["audio"])
+    nxt_audio = list(nxt["audio"])
+
+    if nxt["video_end"] <= prev["video_end"]:
+        # next 完全落在 prev 内：保留 prev 的音频，不重复追加。
+        merged_audio = prev_audio
+    else:
+        if gap < 0:
+            # 重叠：从 next 头部裁掉重叠帧对应的样本，重叠段只播一次。
+            overlap_samples = _frames_to_samples(-gap, sample_rate, fps)
+            nxt_part = nxt_audio[overlap_samples:]
+            merged_audio = prev_audio + nxt_part
+        elif gap > 0:
+            # 有间隔：拼接处补 gap 帧的静音，保证合并区间连续。
+            silence_samples = _frames_to_samples(gap, sample_rate, fps)
+            merged_audio = prev_audio + [0] * silence_samples + nxt_audio
+        else:
+            # 首尾相接：直接拼接，帧数与样本数都是两段之和。
+            merged_audio = prev_audio + nxt_audio
+
+    return {
+        "clip_id": f"{prev['clip_id']}+{nxt['clip_id']}",
+        "video_start": video_start,
+        "video_end": video_end,
+        "content_start": prev["content_start"],
+        "content_end": nxt["content_end"],
+        "audio_start": prev["audio_start"],
+        "audio": merged_audio,
+        "sample_rate": sample_rate,
+        "fps": fps,
+        "merged_ids": [prev["clip_id"], nxt["clip_id"]],
+    }
 
 
 def duration_samples(clip, sample_rate, fps):
@@ -243,7 +392,14 @@ def duration_samples(clip, sample_rate, fps):
     * 帧长度必须 > 0；``sample_rate <= 0`` 或 ``fps <= 0`` 抛
       :class:`ValueError`。
     """
-    raise NotImplementedError
+    if sample_rate <= 0:
+        raise ValueError("sample_rate 必须 > 0")
+    if fps <= 0:
+        raise ValueError("fps 必须 > 0")
+    frame_count = clip["video_end"] - clip["video_start"]
+    if frame_count <= 0:
+        raise ValueError("片段帧长度必须 > 0")
+    return _frames_to_samples(frame_count, sample_rate, fps)
 
 
 def validate_clip(clip, bounds):
@@ -276,7 +432,35 @@ def validate_clip(clip, bounds):
     * 音画同步必须实际比较 ``audio_start`` 与 ``video_start`` 换算后的样本号，
       不能只看两个字段是否相等。
     """
-    raise NotImplementedError
+    clip_id = clip["clip_id"]
+    problems = []
+
+    video_start = clip["video_start"]
+    video_end = clip["video_end"]
+    if (
+        video_start < bounds["start"]
+        or video_end > bounds["end"]
+        or video_start >= video_end
+    ):
+        problems.append(f"out_of_bounds:{clip_id}")
+
+    content_start = clip["content_start"]
+    content_end = clip["content_end"]
+    if (
+        content_start < video_start
+        or content_end > video_end
+        or content_start >= content_end
+    ):
+        problems.append(f"negative_handle:{clip_id}")
+
+    # 实际换算视频起点对应的源样本号，与 audio_start 比较（容差 1 样本）。
+    expected_audio = _frames_to_samples(
+        video_start, clip["sample_rate"], clip["fps"]
+    )
+    if abs(expected_audio - clip["audio_start"]) > 1:
+        problems.append(f"audio_desync:{clip_id}")
+
+    return problems
 
 
 def preroll_batch(clips, config):
@@ -320,4 +504,33 @@ def preroll_batch(clips, config):
     * 不修改 ``clips`` 或 ``config``；输入项的顺序必须保留。
     * 某条片段非法时抛 :class:`ValueError`，错误应指出 ``clip_id``。
     """
-    raise NotImplementedError
+    preroll_frames = config.get("preroll_frames", 0)
+    postroll_frames = config.get("postroll_frames", 0)
+    clip_bounds = config["bounds"]
+
+    result_clips = []
+    total_frames = 0
+    for clip in clips:
+        try:
+            expanded = expand_clip(
+                clip, preroll_frames, postroll_frames, clip_bounds
+            )
+            # 每条片段用自己的起点与音频参数独立计算，禁止跨片段复用。
+            expanded["audio_offset"] = audio_offsets(
+                expanded["video_start"],
+                clip["audio_start"],
+                clip["sample_rate"],
+                clip["fps"],
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"片段 {clip.get('clip_id')!r} 处理失败: {exc}"
+            ) from exc
+        total_frames += expanded["video_end"] - expanded["video_start"]
+        result_clips.append(expanded)
+
+    return {
+        "clips": result_clips,
+        "count": len(result_clips),
+        "total_frames": total_frames,
+    }
